@@ -59,6 +59,22 @@ curl -X POST http://localhost:8080/download \
 4. En **Settings → Networking** genera un **Public Domain** y copia la URL.
 5. Pégala en la app de Lovable.
 
+## ⚠️ Bloqueo "Sign in to confirm you're not a bot"
+
+YouTube bloquea peticiones desde IPs de datacenter (Render, Railway…) pidiendo login. El backend ya intenta esquivarlo usando los clientes `android`/`ios` y reintentos, pero **si el bloqueo persiste, la única solución fiable es pasar tus cookies de YouTube**:
+
+1. En tu navegador (logueado en YouTube), instala la extensión **"Get cookies.txt LOCALLY"** (Chrome/Firefox).
+2. Abre `youtube.com`, pulsa la extensión y exporta como **Netscape format**. Te baja un `cookies.txt`.
+3. Abre el archivo, copia **todo** su contenido.
+4. En Render: tu servicio → **Environment** → **Add Environment Variable**:
+   - Key: `YT_COOKIES`
+   - Value: pega el contenido completo del `cookies.txt`
+5. **Save Changes** (redeploya solo).
+
+Recomendación: usa una **cuenta de Google secundaria** (no la principal) para generar las cookies, porque YouTube podría marcarla.
+
+Las cookies caducan cada cierto tiempo (semanas/meses); si vuelves a ver el error, regenéralas.
+
 ## Notas legales
 
 Úsalo solo con contenido para el que tengas derechos. Respeta los Términos de Servicio de YouTube.
