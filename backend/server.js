@@ -15,9 +15,15 @@ import { writeFile } from "node:fs/promises";
 // YouTube's "Sign in to confirm you're not a bot" block on datacenter IPs.
 const COOKIES_PATH = "/tmp/yt-cookies.txt";
 let cookiesReady = false;
+let cookiesLineCount = 0;
 if (process.env.YT_COOKIES && process.env.YT_COOKIES.trim()) {
   try {
-    await writeFile(COOKIES_PATH, process.env.YT_COOKIES, "utf8");
+    const cookiesText = process.env.YT_COOKIES
+      .trim()
+      .replace(/^['"]|['"]$/g, "")
+      .replace(/\\n/g, "\n");
+    cookiesLineCount = cookiesText.split("\n").filter(Boolean).length;
+    await writeFile(COOKIES_PATH, cookiesText, "utf8");
     cookiesReady = true;
     console.log("YT_COOKIES loaded into", COOKIES_PATH);
   } catch (e) {
@@ -65,6 +71,7 @@ app.get("/", (_req, res) =>
     service: "yt-mp3",
     cookiesLoaded: cookiesReady,
     cookiesBytes: process.env.YT_COOKIES ? process.env.YT_COOKIES.length : 0,
+    cookiesLines: cookiesLineCount,
   })
 );
 
@@ -78,6 +85,9 @@ app.get("/info", async (req, res) => {
     "--no-warnings",
     url,
   ];
+  if (cookiesReady) {
+    args.splice(args.length - 1, 0, "--cookies", COOKIES_PATH);
+  }
   const child = spawn("yt-dlp", args);
   let out = "";
   let err = "";
