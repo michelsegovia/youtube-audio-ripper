@@ -113,8 +113,19 @@ app.post("/download", async (req, res) => {
     "--no-playlist-reverse",
     "--restrict-filenames",
     "--no-warnings",
+    "--ignore-errors",
+    "--retries", "5",
+    "--extractor-retries", "5",
+    "--user-agent",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    // Try multiple YouTube clients to bypass bot checks
+    "--extractor-args", "youtube:player_client=android,ios,web",
     "-o", path.join(workDir, "%(title)s [%(id)s].%(ext)s"),
   ];
+
+  if (cookiesReady) {
+    commonArgs.push("--cookies", COOKIES_PATH);
+  }
 
   if (!playlist) {
     commonArgs.push("--no-playlist");
