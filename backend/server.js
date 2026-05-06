@@ -59,7 +59,14 @@ function sanitize(name) {
   return name.replace(/[\\/:*?"<>|\r\n]+/g, "_").slice(0, 180);
 }
 
-app.get("/", (_req, res) => res.json({ ok: true, service: "yt-mp3" }));
+app.get("/", (_req, res) =>
+  res.json({
+    ok: true,
+    service: "yt-mp3",
+    cookiesLoaded: cookiesReady,
+    cookiesBytes: process.env.YT_COOKIES ? process.env.YT_COOKIES.length : 0,
+  })
+);
 
 app.get("/info", async (req, res) => {
   const parsed = BodySchema.safeParse({ url: req.query.url });
