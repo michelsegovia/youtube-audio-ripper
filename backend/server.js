@@ -8,6 +8,22 @@ import { createReadStream } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import archiver from "archiver";
+import { writeFile } from "node:fs/promises";
+
+// If YT_COOKIES env var is set (Netscape cookies.txt content), write it to disk
+// once at startup so yt-dlp can use it. This is the reliable way to bypass
+// YouTube's "Sign in to confirm you're not a bot" block on datacenter IPs.
+const COOKIES_PATH = "/tmp/yt-cookies.txt";
+let cookiesReady = false;
+if (process.env.YT_COOKIES && process.env.YT_COOKIES.trim()) {
+  try {
+    await writeFile(COOKIES_PATH, process.env.YT_COOKIES, "utf8");
+    cookiesReady = true;
+    console.log("YT_COOKIES loaded into", COOKIES_PATH);
+  } catch (e) {
+    console.error("Failed to write cookies file:", e);
+  }
+}
 
 const app = express();
 app.use(express.json({ limit: "16kb" }));
@@ -97,8 +113,19 @@ app.post("/download", async (req, res) => {
     "--no-playlist-reverse",
     "--restrict-filenames",
     "--no-warnings",
+    "--ignore-errors",
+    "--retries", "5",
+    "--extractor-retries", "5",
+    "--user-agent",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    // Try multiple YouTube clients to bypass bot checks
+    "--extractor-args", "youtube:player_client=android,ios,web",
     "-o", path.join(workDir, "%(title)s [%(id)s].%(ext)s"),
   ];
+
+  if (cookiesReady) {
+    commonArgs.push("--cookies", COOKIES_PATH);
+  }
 
   if (!playlist) {
     commonArgs.push("--no-playlist");
