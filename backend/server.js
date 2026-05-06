@@ -120,6 +120,7 @@ app.post("/download", async (req, res) => {
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     // Try multiple YouTube clients to bypass bot checks
     "--extractor-args", "youtube:player_client=android,ios,web",
+    "--extractor-args", "youtubetab:skip=authcheck",
     "-o", path.join(workDir, "%(title)s [%(id)s].%(ext)s"),
   ];
 
