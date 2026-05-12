@@ -65,6 +65,7 @@ function sanitize(name) {
 
 function buildYtArgs(workDir, url, playlist) {
   const args = [
+    "-f", "bestaudio/best",
     "-x",
     "--audio-format", "mp3",
     "--audio-quality", "192K",
