@@ -55,6 +55,37 @@ function filenameFromHeader(header: string | null, fallback: string) {
   }
 }
 
+async function streamToDownload(
+  res: Response,
+  filename: string,
+  onProgress: (mb: number) => void
+) {
+  const reader = res.body!.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      chunks.push(value);
+      received += value.length;
+      onProgress(received / (1024 * 1024));
+    }
+  }
+  const blob = new Blob(chunks as BlobPart[], {
+    type: res.headers.get("content-type") ?? "application/octet-stream",
+  });
+  const objUrl = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = objUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(objUrl);
+}
+
 const STORAGE_KEY = "ytmp3.backendUrl";
 
 const Index = () => {
