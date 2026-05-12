@@ -63,28 +63,36 @@ function sanitize(name) {
   return name.replace(/[\\/:*?"<>|\r\n]+/g, "_").slice(0, 180);
 }
 
-function buildYtArgs(workDir, url, playlist) {
-  // Format selection: prefer m4a/mp3 audio-only, then any bestaudio, then best (video+audio).
-  // Including "best" as last fallback handles videos where YouTube only returns
-  // muxed/HLS streams for the available clients.
-  const formatSelector =
-    "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best[ext=mp4]/best";
+// Strategy presets for yt-dlp. We try them in order; if one fails with
+// "Requested format is not available" or similar, we move to the next.
+const STRATEGIES = [
+  {
+    name: "default-audio",
+    // No -f: let yt-dlp pick the best audio for -x automatically.
+    format: null,
+    clients: "tv,ios,web_safari,web",
+  },
+  {
+    name: "bestaudio-or-best",
+    format: "bestaudio/best",
+    clients: "ios,tv,web_safari,android,web",
+  },
+  {
+    name: "any-format",
+    // Allow HLS/DASH/muxed; ffmpeg will extract audio.
+    format: "bestaudio*/best",
+    clients: "android,ios,tv,web,web_safari,mweb",
+  },
+];
 
-  // Client list: tv_embedded + web_safari + ios is currently the most reliable
-  // combo on datacenter IPs. android client is often blocked now.
-  const youtubePlayerClients = cookiesReady
-    ? "tv,web_safari,web,ios"
-    : "tv_embedded,ios,web_safari,web";
-
+function buildYtArgs(workDir, url, playlist, strategy = STRATEGIES[0]) {
   const args = [
-    "-f", formatSelector,
     "-x",
     "--audio-format", "mp3",
     "--audio-quality", "192K",
     "--no-playlist-reverse",
     "--restrict-filenames",
     "--no-warnings",
-    "--ignore-errors",
     "--retries", "10",
     "--extractor-retries", "10",
     "--fragment-retries", "10",
@@ -92,17 +100,67 @@ function buildYtArgs(workDir, url, playlist) {
     "--newline",
     "--user-agent",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    // Combine all youtube extractor args in a single flag to avoid one
-    // overriding the other.
     "--extractor-args",
-    `youtube:player_client=${youtubePlayerClients}`,
-    "--extractor-args", "youtubetab:skip=authcheck",
+    `youtube:player_client=${strategy.clients};youtubetab:skip=authcheck`,
     "-o", path.join(workDir, "%(title)s [%(id)s].%(ext)s"),
   ];
+  if (strategy.format) {
+    args.unshift("-f", strategy.format);
+  }
+  if (playlist) {
+    // For playlists ignore individual video errors so one bad item doesn't
+    // kill the whole job.
+    args.push("--ignore-errors");
+  }
   if (cookiesReady) args.push("--cookies", COOKIES_PATH);
   if (!playlist) args.push("--no-playlist");
   args.push(url);
   return args;
+}
+
+function isFormatError(stderr) {
+  return /Requested format is not available|No video formats found|Unable to extract|Sign in to confirm/i.test(stderr || "");
+}
+
+function runYtDlp(workDir, url, playlist, strategy, onStdout) {
+  return new Promise((resolve) => {
+    const args = buildYtArgs(workDir, url, playlist, strategy);
+    console.log(`yt-dlp [${strategy.name}]`, args.join(" "));
+    const child = spawn("yt-dlp", args);
+    let stderr = "";
+    child.stdout.on("data", (d) => {
+      const text = d.toString();
+      process.stdout.write(text);
+      onStdout?.(text, child);
+    });
+    child.stderr.on("data", (d) => {
+      stderr += d.toString();
+      process.stderr.write(d);
+    });
+    child.on("error", (e) => resolve({ code: -1, stderr: String(e), child }));
+    child.on("close", (code) => resolve({ code, stderr, child }));
+  });
+}
+
+async function runYtDlpWithFallback(workDir, url, playlist, onStdout) {
+  let last = null;
+  for (const strategy of STRATEGIES) {
+    // Clean previous partial files from earlier strategy attempts.
+    try {
+      const files = await readdir(workDir);
+      await Promise.all(
+        files
+          .filter((f) => !f.endsWith(".mp3") || last)
+          .map((f) => rm(path.join(workDir, f), { force: true }))
+      );
+    } catch {}
+    const result = await runYtDlp(workDir, url, playlist, strategy, onStdout);
+    last = { ...result, strategy: strategy.name };
+    if (result.code === 0) return last;
+    if (!isFormatError(result.stderr)) return last; // non-format error: stop
+    console.warn(`Strategy ${strategy.name} failed with format error, trying next...`);
+  }
+  return last;
 }
 
 app.get("/", (_req, res) =>
