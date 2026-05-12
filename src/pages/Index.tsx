@@ -106,61 +106,87 @@ const Index = () => {
     setDownloadedMb(0);
     setStatus(
       isPlaylist
-        ? "Procesando playlist (esto puede tardar varios minutos)..."
+        ? "Encolando playlist..."
         : "Convirtiendo a MP3..."
     );
 
     try {
-      const res = await fetch(`${backendUrl}/download`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ url: parsed.data }),
-        signal: controller.signal,
-      });
-
-      if (!res.ok || !res.body) {
-        const text = await res.text().catch(() => "");
-        throw new Error(text || `Error del backend (${res.status})`);
-      }
-
-      const fallback = isPlaylist ? "playlist.zip" : "audio.mp3";
-      const filename = filenameFromHeader(
-        res.headers.get("content-disposition"),
-        fallback
-      );
-
-      // Stream to track downloaded size
-      const reader = res.body.getReader();
-      const chunks: Uint8Array[] = [];
-      let received = 0;
-      // eslint-disable-next-line no-constant-condition
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value) {
-          chunks.push(value);
-          received += value.length;
-          setDownloadedMb(received / (1024 * 1024));
+      if (isPlaylist) {
+        // Async job flow
+        const startRes = await fetch(`${backendUrl}/jobs`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ url: parsed.data }),
+          signal: controller.signal,
+        });
+        if (!startRes.ok) {
+          const text = await startRes.text().catch(() => "");
+          throw new Error(text || `Error iniciando job (${startRes.status})`);
         }
+        const { jobId } = await startRes.json();
+
+        // Poll status
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+          if (controller.signal.aborted) throw new Error("aborted");
+          await new Promise((r) => setTimeout(r, 3000));
+          const stRes = await fetch(`${backendUrl}/jobs/${jobId}`, {
+            signal: controller.signal,
+          });
+          if (!stRes.ok) throw new Error(`Estado no disponible (${stRes.status})`);
+          const st = await stRes.json();
+          if (st.status === "completed") {
+            setStatus("Empaquetando ZIP y descargando...");
+            break;
+          }
+          if (st.status === "failed") {
+            throw new Error(st.error || "El backend reportó un fallo");
+          }
+          const progress =
+            st.total > 0
+              ? `${st.done ?? 0}/${st.total} pistas`
+              : `${st.done ?? 0} pistas listas`;
+          setStatus(`Procesando playlist · ${progress}`);
+        }
+
+        // Download the produced ZIP
+        const dlRes = await fetch(`${backendUrl}/jobs/${jobId}/download`, {
+          signal: controller.signal,
+        });
+        if (!dlRes.ok || !dlRes.body) {
+          const text = await dlRes.text().catch(() => "");
+          throw new Error(text || `Error descargando ZIP (${dlRes.status})`);
+        }
+        const filename = filenameFromHeader(
+          dlRes.headers.get("content-disposition"),
+          "playlist.zip"
+        );
+        await streamToDownload(dlRes, filename, setDownloadedMb);
+        toast.success(`Descargado: ${filename}`);
+        setStatus("");
+      } else {
+        // Single video sync flow
+        const res = await fetch(`${backendUrl}/download`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ url: parsed.data }),
+          signal: controller.signal,
+        });
+        if (!res.ok || !res.body) {
+          const text = await res.text().catch(() => "");
+          throw new Error(text || `Error del backend (${res.status})`);
+        }
+        const filename = filenameFromHeader(
+          res.headers.get("content-disposition"),
+          "audio.mp3"
+        );
+        await streamToDownload(res, filename, setDownloadedMb);
+        toast.success(`Descargado: ${filename}`);
+        setStatus("");
       }
-
-      const blob = new Blob(chunks as BlobPart[], {
-        type: res.headers.get("content-type") ?? "application/octet-stream",
-      });
-      const objUrl = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = objUrl;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(objUrl);
-
-      toast.success(`Descargado: ${filename}`);
-      setStatus("");
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (controller.signal.aborted) {
+      if (controller.signal.aborted || msg === "aborted") {
         toast.info("Descarga cancelada");
       } else {
         toast.error(msg.slice(0, 300));
