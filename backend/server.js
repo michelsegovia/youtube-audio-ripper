@@ -378,20 +378,19 @@ app.post("/download", async (req, res) => {
       return;
     }
     const file = files[0];
-      const full = path.join(workDir, file);
-      const s = await stat(full);
-      res.setHeader("Content-Type", "audio/mpeg");
-      res.setHeader("Content-Length", s.size);
-      res.setHeader("Content-Disposition", `attachment; filename="${sanitize(file)}"`);
-      const stream = createReadStream(full);
-      stream.on("close", cleanup);
-      stream.pipe(res);
-    } catch (e) {
-      console.error(e);
-      if (!res.headersSent) res.status(500).json({ error: String(e) });
-      cleanup();
-    }
-  });
+    const full = path.join(workDir, file);
+    const s = await stat(full);
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Content-Length", s.size);
+    res.setHeader("Content-Disposition", `attachment; filename="${sanitize(file)}"`);
+    const stream = createReadStream(full);
+    stream.on("close", cleanup);
+    stream.pipe(res);
+  } catch (e) {
+    console.error(e);
+    if (!res.headersSent) res.status(500).json({ error: String(e) });
+    cleanup();
+  }
 });
 
 const port = process.env.PORT || 8080;
