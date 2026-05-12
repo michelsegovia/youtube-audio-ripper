@@ -354,27 +354,30 @@ app.post("/download", async (req, res) => {
   const cleanup = () => rm(workDir, { recursive: true, force: true }).catch(() => {});
   res.on("close", cleanup);
 
-  const ytArgs = buildYtArgs(workDir, url, false);
-  console.log("yt-dlp", ytArgs.join(" "));
-  const child = spawn("yt-dlp", ytArgs);
-  let stderr = "";
-  child.stderr.on("data", (d) => { stderr += d.toString(); process.stderr.write(d); });
-  child.stdout.on("data", (d) => process.stdout.write(d));
+  const result = await runYtDlpWithFallback(workDir, url, false);
 
-  child.on("close", async (code) => {
-    if (code !== 0) {
-      if (!res.headersSent) res.status(500).json({ error: stderr.slice(-2000) || "yt-dlp failed" });
+  if (result.code !== 0) {
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: (result.stderr || "yt-dlp failed").slice(-2000),
+        cookiesLoaded: cookiesReady,
+        hint: isFormatError(result.stderr)
+          ? "YouTube no entregó formatos descargables desde el servidor. Prueba a configurar YT_COOKIES en Render y redeploy."
+          : undefined,
+      });
+    }
+    cleanup();
+    return;
+  }
+
+  try {
+    const files = (await readdir(workDir)).filter((f) => f.endsWith(".mp3"));
+    if (files.length === 0) {
+      res.status(500).json({ error: "No MP3 produced" });
       cleanup();
       return;
     }
-    try {
-      const files = (await readdir(workDir)).filter((f) => f.endsWith(".mp3"));
-      if (files.length === 0) {
-        res.status(500).json({ error: "No MP3 produced" });
-        cleanup();
-        return;
-      }
-      const file = files[0];
+    const file = files[0];
       const full = path.join(workDir, file);
       const s = await stat(full);
       res.setHeader("Content-Type", "audio/mpeg");
