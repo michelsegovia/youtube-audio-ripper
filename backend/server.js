@@ -64,8 +64,20 @@ function sanitize(name) {
 }
 
 function buildYtArgs(workDir, url, playlist) {
+  // Format selection: prefer m4a/mp3 audio-only, then any bestaudio, then best (video+audio).
+  // Including "best" as last fallback handles videos where YouTube only returns
+  // muxed/HLS streams for the available clients.
+  const formatSelector =
+    "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best[ext=mp4]/best";
+
+  // Client list: tv_embedded + web_safari + ios is currently the most reliable
+  // combo on datacenter IPs. android client is often blocked now.
+  const youtubePlayerClients = cookiesReady
+    ? "tv,web_safari,web,ios"
+    : "tv_embedded,ios,web_safari,web";
+
   const args = [
-    "-f", "bestaudio/best",
+    "-f", formatSelector,
     "-x",
     "--audio-format", "mp3",
     "--audio-quality", "192K",
@@ -73,15 +85,17 @@ function buildYtArgs(workDir, url, playlist) {
     "--restrict-filenames",
     "--no-warnings",
     "--ignore-errors",
-    "--retries", "5",
-    "--extractor-retries", "5",
+    "--retries", "10",
+    "--extractor-retries", "10",
+    "--fragment-retries", "10",
+    "--force-ipv4",
     "--newline",
     "--user-agent",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    // Combine all youtube extractor args in a single flag to avoid one
+    // overriding the other.
     "--extractor-args",
-    cookiesReady
-      ? "youtube:player_client=tv,web_safari,web;skip=hls,dash"
-      : "youtube:player_client=android,ios,web",
+    `youtube:player_client=${youtubePlayerClients}`,
     "--extractor-args", "youtubetab:skip=authcheck",
     "-o", path.join(workDir, "%(title)s [%(id)s].%(ext)s"),
   ];
