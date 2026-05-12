@@ -4,7 +4,7 @@ import rateLimit from "express-rate-limit";
 import { z } from "zod";
 import { spawn } from "node:child_process";
 import { mkdtemp, rm, readdir, stat, writeFile } from "node:fs/promises";
-import { createReadStream } from "node:fs";
+import { createReadStream, createWriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -194,10 +194,7 @@ async function runPlaylistJob(job) {
       // Build ZIP
       const zipPath = path.join(job.workDir, "playlist.zip");
       await new Promise((resolve, reject) => {
-        const output = require("node:fs").createWriteStream
-          ? require("node:fs").createWriteStream(zipPath)
-          : null;
-        if (!output) return reject(new Error("fs unavailable"));
+        const output = createWriteStream(zipPath);
         const archive = archiver("zip", { zlib: { level: 6 } });
         output.on("close", resolve);
         archive.on("error", reject);
