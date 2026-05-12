@@ -63,28 +63,36 @@ function sanitize(name) {
   return name.replace(/[\\/:*?"<>|\r\n]+/g, "_").slice(0, 180);
 }
 
-function buildYtArgs(workDir, url, playlist) {
-  // Format selection: prefer m4a/mp3 audio-only, then any bestaudio, then best (video+audio).
-  // Including "best" as last fallback handles videos where YouTube only returns
-  // muxed/HLS streams for the available clients.
-  const formatSelector =
-    "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best[ext=mp4]/best";
+// Strategy presets for yt-dlp. We try them in order; if one fails with
+// "Requested format is not available" or similar, we move to the next.
+const STRATEGIES = [
+  {
+    name: "default-audio",
+    // No -f: let yt-dlp pick the best audio for -x automatically.
+    format: null,
+    clients: "tv,ios,web_safari,web",
+  },
+  {
+    name: "bestaudio-or-best",
+    format: "bestaudio/best",
+    clients: "ios,tv,web_safari,android,web",
+  },
+  {
+    name: "any-format",
+    // Allow HLS/DASH/muxed; ffmpeg will extract audio.
+    format: "bestaudio*/best",
+    clients: "android,ios,tv,web,web_safari,mweb",
+  },
+];
 
-  // Client list: tv_embedded + web_safari + ios is currently the most reliable
-  // combo on datacenter IPs. android client is often blocked now.
-  const youtubePlayerClients = cookiesReady
-    ? "tv,web_safari,web,ios"
-    : "tv_embedded,ios,web_safari,web";
-
+function buildYtArgs(workDir, url, playlist, strategy = STRATEGIES[0]) {
   const args = [
-    "-f", formatSelector,
     "-x",
     "--audio-format", "mp3",
     "--audio-quality", "192K",
     "--no-playlist-reverse",
     "--restrict-filenames",
     "--no-warnings",
-    "--ignore-errors",
     "--retries", "10",
     "--extractor-retries", "10",
     "--fragment-retries", "10",
@@ -92,17 +100,67 @@ function buildYtArgs(workDir, url, playlist) {
     "--newline",
     "--user-agent",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    // Combine all youtube extractor args in a single flag to avoid one
-    // overriding the other.
     "--extractor-args",
-    `youtube:player_client=${youtubePlayerClients}`,
-    "--extractor-args", "youtubetab:skip=authcheck",
+    `youtube:player_client=${strategy.clients};youtubetab:skip=authcheck`,
     "-o", path.join(workDir, "%(title)s [%(id)s].%(ext)s"),
   ];
+  if (strategy.format) {
+    args.unshift("-f", strategy.format);
+  }
+  if (playlist) {
+    // For playlists ignore individual video errors so one bad item doesn't
+    // kill the whole job.
+    args.push("--ignore-errors");
+  }
   if (cookiesReady) args.push("--cookies", COOKIES_PATH);
   if (!playlist) args.push("--no-playlist");
   args.push(url);
   return args;
+}
+
+function isFormatError(stderr) {
+  return /Requested format is not available|No video formats found|Unable to extract|Sign in to confirm/i.test(stderr || "");
+}
+
+function runYtDlp(workDir, url, playlist, strategy, onStdout) {
+  return new Promise((resolve) => {
+    const args = buildYtArgs(workDir, url, playlist, strategy);
+    console.log(`yt-dlp [${strategy.name}]`, args.join(" "));
+    const child = spawn("yt-dlp", args);
+    let stderr = "";
+    child.stdout.on("data", (d) => {
+      const text = d.toString();
+      process.stdout.write(text);
+      onStdout?.(text, child);
+    });
+    child.stderr.on("data", (d) => {
+      stderr += d.toString();
+      process.stderr.write(d);
+    });
+    child.on("error", (e) => resolve({ code: -1, stderr: String(e), child }));
+    child.on("close", (code) => resolve({ code, stderr, child }));
+  });
+}
+
+async function runYtDlpWithFallback(workDir, url, playlist, onStdout) {
+  let last = null;
+  for (const strategy of STRATEGIES) {
+    // Clean previous partial files from earlier strategy attempts.
+    try {
+      const files = await readdir(workDir);
+      await Promise.all(
+        files
+          .filter((f) => !f.endsWith(".mp3") || last)
+          .map((f) => rm(path.join(workDir, f), { force: true }))
+      );
+    } catch {}
+    const result = await runYtDlp(workDir, url, playlist, strategy, onStdout);
+    last = { ...result, strategy: strategy.name };
+    if (result.code === 0) return last;
+    if (!isFormatError(result.stderr)) return last; // non-format error: stop
+    console.warn(`Strategy ${strategy.name} failed with format error, trying next...`);
+  }
+  return last;
 }
 
 app.get("/", (_req, res) =>
@@ -161,17 +219,17 @@ setInterval(() => {
 
 async function runPlaylistJob(job) {
   job.status = "processing";
-  const args = buildYtArgs(job.workDir, job.url, true);
-  console.log("yt-dlp", args.join(" "));
-  const child = spawn("yt-dlp", args);
-  let stderr = "";
-  let stdoutBuf = "";
 
-  child.stdout.on("data", (d) => {
-    const text = d.toString();
-    stdoutBuf += text;
-    process.stdout.write(text);
-    // Count completed downloads via "[ExtractAudio] Destination" or "[download] Destination"
+  let timedOut = false;
+  let activeChild = null;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    try { activeChild?.kill("SIGKILL"); } catch {}
+    job.error = "Timeout: la playlist tardó demasiado (>25 min).";
+  }, 25 * 60 * 1000);
+
+  const onStdout = (text, child) => {
+    activeChild = child;
     const lines = text.split("\n");
     for (const line of lines) {
       if (/\[ExtractAudio\] Destination:/.test(line)) {
@@ -183,59 +241,41 @@ async function runPlaylistJob(job) {
         job.total = parseInt(m[2], 10);
       }
     }
-  });
+  };
 
-  child.stderr.on("data", (d) => {
-    stderr += d.toString();
-    process.stderr.write(d);
-  });
+  const result = await runYtDlpWithFallback(job.workDir, job.url, true, onStdout);
+  clearTimeout(timeout);
 
-  // Hard timeout: 25 minutes
-  const timeout = setTimeout(() => {
-    try { child.kill("SIGKILL"); } catch {}
-    job.error = "Timeout: la playlist tardó demasiado (>25 min).";
-  }, 25 * 60 * 1000);
-
-  child.on("close", async (code) => {
-    clearTimeout(timeout);
-    try {
-      const files = (await readdir(job.workDir)).filter((f) => f.endsWith(".mp3"));
-      if (files.length === 0) {
-        job.status = "failed";
-        job.error = job.error || stderr.slice(-2000) || `yt-dlp exit ${code}`;
-        job.finishedAt = Date.now();
-        return;
-      }
-      // Build ZIP
-      const zipPath = path.join(job.workDir, "playlist.zip");
-      await new Promise((resolve, reject) => {
-        const output = createWriteStream(zipPath);
-        const archive = archiver("zip", { zlib: { level: 6 } });
-        output.on("close", resolve);
-        archive.on("error", reject);
-        archive.pipe(output);
-        for (const f of files) {
-          archive.file(path.join(job.workDir, f), { name: sanitize(f) });
-        }
-        archive.finalize();
-      });
-      job.zipPath = zipPath;
-      job.total = job.total || files.length;
-      job.done = files.length;
-      job.status = "completed";
-      job.finishedAt = Date.now();
-    } catch (e) {
+  try {
+    const files = (await readdir(job.workDir)).filter((f) => f.endsWith(".mp3"));
+    if (files.length === 0) {
       job.status = "failed";
-      job.error = String(e);
+      job.error = job.error || (result?.stderr || "").slice(-2000) || `yt-dlp exit ${result?.code}`;
       job.finishedAt = Date.now();
+      return;
     }
-  });
-
-  child.on("error", (e) => {
+    const zipPath = path.join(job.workDir, "playlist.zip");
+    await new Promise((resolve, reject) => {
+      const output = createWriteStream(zipPath);
+      const archive = archiver("zip", { zlib: { level: 6 } });
+      output.on("close", resolve);
+      archive.on("error", reject);
+      archive.pipe(output);
+      for (const f of files) {
+        archive.file(path.join(job.workDir, f), { name: sanitize(f) });
+      }
+      archive.finalize();
+    });
+    job.zipPath = zipPath;
+    job.total = job.total || files.length;
+    job.done = files.length;
+    job.status = "completed";
+    job.finishedAt = Date.now();
+  } catch (e) {
     job.status = "failed";
     job.error = String(e);
     job.finishedAt = Date.now();
-  });
+  }
 }
 
 app.post("/jobs", async (req, res) => {
@@ -314,41 +354,43 @@ app.post("/download", async (req, res) => {
   const cleanup = () => rm(workDir, { recursive: true, force: true }).catch(() => {});
   res.on("close", cleanup);
 
-  const ytArgs = buildYtArgs(workDir, url, false);
-  console.log("yt-dlp", ytArgs.join(" "));
-  const child = spawn("yt-dlp", ytArgs);
-  let stderr = "";
-  child.stderr.on("data", (d) => { stderr += d.toString(); process.stderr.write(d); });
-  child.stdout.on("data", (d) => process.stdout.write(d));
+  const result = await runYtDlpWithFallback(workDir, url, false);
 
-  child.on("close", async (code) => {
-    if (code !== 0) {
-      if (!res.headersSent) res.status(500).json({ error: stderr.slice(-2000) || "yt-dlp failed" });
+  if (result.code !== 0) {
+    if (!res.headersSent) {
+      res.status(500).json({
+        error: (result.stderr || "yt-dlp failed").slice(-2000),
+        cookiesLoaded: cookiesReady,
+        hint: isFormatError(result.stderr)
+          ? "YouTube no entregó formatos descargables desde el servidor. Prueba a configurar YT_COOKIES en Render y redeploy."
+          : undefined,
+      });
+    }
+    cleanup();
+    return;
+  }
+
+  try {
+    const files = (await readdir(workDir)).filter((f) => f.endsWith(".mp3"));
+    if (files.length === 0) {
+      res.status(500).json({ error: "No MP3 produced" });
       cleanup();
       return;
     }
-    try {
-      const files = (await readdir(workDir)).filter((f) => f.endsWith(".mp3"));
-      if (files.length === 0) {
-        res.status(500).json({ error: "No MP3 produced" });
-        cleanup();
-        return;
-      }
-      const file = files[0];
-      const full = path.join(workDir, file);
-      const s = await stat(full);
-      res.setHeader("Content-Type", "audio/mpeg");
-      res.setHeader("Content-Length", s.size);
-      res.setHeader("Content-Disposition", `attachment; filename="${sanitize(file)}"`);
-      const stream = createReadStream(full);
-      stream.on("close", cleanup);
-      stream.pipe(res);
-    } catch (e) {
-      console.error(e);
-      if (!res.headersSent) res.status(500).json({ error: String(e) });
-      cleanup();
-    }
-  });
+    const file = files[0];
+    const full = path.join(workDir, file);
+    const s = await stat(full);
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Content-Length", s.size);
+    res.setHeader("Content-Disposition", `attachment; filename="${sanitize(file)}"`);
+    const stream = createReadStream(full);
+    stream.on("close", cleanup);
+    stream.pipe(res);
+  } catch (e) {
+    console.error(e);
+    if (!res.headersSent) res.status(500).json({ error: String(e) });
+    cleanup();
+  }
 });
 
 const port = process.env.PORT || 8080;
