@@ -219,17 +219,17 @@ setInterval(() => {
 
 async function runPlaylistJob(job) {
   job.status = "processing";
-  const args = buildYtArgs(job.workDir, job.url, true);
-  console.log("yt-dlp", args.join(" "));
-  const child = spawn("yt-dlp", args);
-  let stderr = "";
-  let stdoutBuf = "";
 
-  child.stdout.on("data", (d) => {
-    const text = d.toString();
-    stdoutBuf += text;
-    process.stdout.write(text);
-    // Count completed downloads via "[ExtractAudio] Destination" or "[download] Destination"
+  let timedOut = false;
+  let activeChild = null;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    try { activeChild?.kill("SIGKILL"); } catch {}
+    job.error = "Timeout: la playlist tardó demasiado (>25 min).";
+  }, 25 * 60 * 1000);
+
+  const onStdout = (text, child) => {
+    activeChild = child;
     const lines = text.split("\n");
     for (const line of lines) {
       if (/\[ExtractAudio\] Destination:/.test(line)) {
@@ -241,59 +241,41 @@ async function runPlaylistJob(job) {
         job.total = parseInt(m[2], 10);
       }
     }
-  });
+  };
 
-  child.stderr.on("data", (d) => {
-    stderr += d.toString();
-    process.stderr.write(d);
-  });
+  const result = await runYtDlpWithFallback(job.workDir, job.url, true, onStdout);
+  clearTimeout(timeout);
 
-  // Hard timeout: 25 minutes
-  const timeout = setTimeout(() => {
-    try { child.kill("SIGKILL"); } catch {}
-    job.error = "Timeout: la playlist tardó demasiado (>25 min).";
-  }, 25 * 60 * 1000);
-
-  child.on("close", async (code) => {
-    clearTimeout(timeout);
-    try {
-      const files = (await readdir(job.workDir)).filter((f) => f.endsWith(".mp3"));
-      if (files.length === 0) {
-        job.status = "failed";
-        job.error = job.error || stderr.slice(-2000) || `yt-dlp exit ${code}`;
-        job.finishedAt = Date.now();
-        return;
-      }
-      // Build ZIP
-      const zipPath = path.join(job.workDir, "playlist.zip");
-      await new Promise((resolve, reject) => {
-        const output = createWriteStream(zipPath);
-        const archive = archiver("zip", { zlib: { level: 6 } });
-        output.on("close", resolve);
-        archive.on("error", reject);
-        archive.pipe(output);
-        for (const f of files) {
-          archive.file(path.join(job.workDir, f), { name: sanitize(f) });
-        }
-        archive.finalize();
-      });
-      job.zipPath = zipPath;
-      job.total = job.total || files.length;
-      job.done = files.length;
-      job.status = "completed";
-      job.finishedAt = Date.now();
-    } catch (e) {
+  try {
+    const files = (await readdir(job.workDir)).filter((f) => f.endsWith(".mp3"));
+    if (files.length === 0) {
       job.status = "failed";
-      job.error = String(e);
+      job.error = job.error || (result?.stderr || "").slice(-2000) || `yt-dlp exit ${result?.code}`;
       job.finishedAt = Date.now();
+      return;
     }
-  });
-
-  child.on("error", (e) => {
+    const zipPath = path.join(job.workDir, "playlist.zip");
+    await new Promise((resolve, reject) => {
+      const output = createWriteStream(zipPath);
+      const archive = archiver("zip", { zlib: { level: 6 } });
+      output.on("close", resolve);
+      archive.on("error", reject);
+      archive.pipe(output);
+      for (const f of files) {
+        archive.file(path.join(job.workDir, f), { name: sanitize(f) });
+      }
+      archive.finalize();
+    });
+    job.zipPath = zipPath;
+    job.total = job.total || files.length;
+    job.done = files.length;
+    job.status = "completed";
+    job.finishedAt = Date.now();
+  } catch (e) {
     job.status = "failed";
     job.error = String(e);
     job.finishedAt = Date.now();
-  });
+  }
 }
 
 app.post("/jobs", async (req, res) => {
